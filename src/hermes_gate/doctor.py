@@ -10,7 +10,7 @@ from typing import Any
 from .codex_install import installed as codex_installed
 from .config import ConfigError, ReviewSpec, load_config
 from .execution import run_argv
-from .gitstate import ContentReadError, diff_digest, repo_root, scope_paths
+from .gitstate import ContentReadError, ScopeError, diff_digest, repo_root, scope
 from .init_repo import verify_runner
 from .receipts import read_receipt
 from .status import Status
@@ -100,9 +100,10 @@ def diagnose(start: Path | None = None) -> dict[str, Any]:
         }
     runner_ok, runner_detail = verify_runner(root)
     try:
-        digest = diff_digest(root, scope_paths(root))
+        selected, scope_base = scope(root)
+        digest = diff_digest(root, selected, base=scope_base)
         input_error = None
-    except ContentReadError as exc:
+    except (ContentReadError, ScopeError) as exc:
         digest = None
         input_error = str(exc)
     receipts: dict[str, Any] = {}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -31,9 +32,11 @@ def parser() -> argparse.ArgumentParser:
         "init", help="install a repository profile, runner, workflow, and baseline"
     )
     init.add_argument("--force", action="store_true")
-    sub.add_parser("fast", help="run the cached session-scoped deterministic gate")
+    fast_command = sub.add_parser("fast", help="run the cached session-scoped deterministic gate")
+    fast_command.add_argument("--base", help="committed base revision for a clean detached checkout")
     sub.add_parser("repair", help="run one configured deterministic repair")
-    sub.add_parser("review", help="run one bounded independent review")
+    review_command = sub.add_parser("review", help="run one bounded independent review")
+    review_command.add_argument("--base", help="committed base revision for a clean detached checkout")
     sub.add_parser("full", help="run the complete declared repository contract")
     bound = sub.add_parser("boundary", help="validate exact receipts for a Git or PR boundary")
     bound.add_argument("action", choices=("commit", "push", "pr-create", "pr-ready"))
@@ -77,9 +80,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     routes: dict[str, Callable[[], dict[str, Any]]] = {
         "init": lambda: _wrap_init(root, args.force),
-        "fast": lambda: fast(root),
+        "fast": lambda: fast(root, base=_scope_base(args)),
         "repair": lambda: repair(root),
-        "review": lambda: review(root),
+        "review": lambda: review(root, base=_scope_base(args)),
         "full": lambda: full(root),
         "boundary": lambda: boundary(root, args.action),
         "uninstall-repo": lambda: _wrap_uninstall(root),
@@ -96,6 +99,11 @@ def _wrap_init(root: Path, force: bool) -> dict[str, Any]:
         "elapsed_ms": round((time.monotonic() - started) * 1000),
         **value,
     }
+
+
+def _scope_base(args: argparse.Namespace) -> str | None:
+    explicit = getattr(args, "base", None)
+    return explicit if explicit is not None else os.environ.get("HERMES_GATE_BASE")
 
 
 def _wrap_uninstall(root: Path) -> dict[str, Any]:

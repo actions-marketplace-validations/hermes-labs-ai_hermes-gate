@@ -15,11 +15,13 @@ from .config import ConfigError, GateConfig, load_config
 from .execution import Execution, run_argv
 from .gitstate import (
     ContentReadError,
+    ScopeError,
     changed_paths,
     diff_digest,
     git,
     git_dir,
-    scope_paths,
+    head,
+    scope,
     staged_paths,
 )
 from .providers import normalize_coderabbit_output
@@ -28,7 +30,9 @@ from .repo_runner import run as run_repository
 from .status import Status
 
 
-def fast(root: Path, *, files: list[str] | None = None) -> dict[str, Any]:
+def fast(
+    root: Path, *, files: list[str] | None = None, base: str | None = None
+) -> dict[str, Any]:
     started = time.monotonic()
     try:
         config = load_config(root)
@@ -36,12 +40,14 @@ def fast(root: Path, *, files: list[str] | None = None) -> dict[str, Any]:
         return result("fast", Status.NOT_CONFIGURED, started, reason="run hermes-gate init")
     except ConfigError as exc:
         return result("fast", Status.ERROR, started, reason=f"invalid profile: {exc}")
-    selected = [
-        path
-        for path in (files if files is not None else scope_paths(root))
-        if config.included(path)
-    ]
-    digest, failure = _digest_or_error(root, selected, "fast", started)
+    raw_selected, scope_base, scope_failure = _scope_or_error(
+        root, "fast", started, files=files, base=base
+    )
+    if scope_failure:
+        return scope_failure
+    assert raw_selected is not None and scope_base is not None
+    selected = [path for path in raw_selected if config.included(path)]
+    digest, failure = _digest_or_error(root, selected, "fast", started, base=scope_base)
     if failure:
         return failure
     cached = valid_receipt(root, "fast", digest)
@@ -83,6 +89,7 @@ def fast(root: Path, *, files: list[str] | None = None) -> dict[str, Any]:
         checks=checks,
         extra={
             "checked_paths": selected,
+            "scope_base": scope_base,
             "reason": reason,
             "runner_version": runner_result.get("runner_version"),
         },
@@ -98,8 +105,12 @@ def full(root: Path) -> dict[str, Any]:
         return result("full", Status.NOT_CONFIGURED, started, reason="run hermes-gate init")
     except ConfigError as exc:
         return result("full", Status.ERROR, started, reason=f"invalid profile: {exc}")
-    selected = [path for path in scope_paths(root) if config.included(path)]
-    digest, failure = _digest_or_error(root, selected, "full", started)
+    raw_selected, scope_base, scope_failure = _scope_or_error(root, "full", started)
+    if scope_failure:
+        return scope_failure
+    assert raw_selected is not None and scope_base is not None
+    selected = [path for path in raw_selected if config.included(path)]
+    digest, failure = _digest_or_error(root, selected, "full", started, base=scope_base)
     if failure:
         return failure
     runner_result = _run_gate(config, "full", root, selected)
@@ -114,7 +125,11 @@ def full(root: Path) -> dict[str, Any]:
             runner_result, list(runner_result.get("checks", [])), root
         ),
         checks=list(runner_result.get("checks", [])),
-        extra={"checked_paths": selected, "reason": runner_result.get("reason", "")},
+        extra={
+            "checked_paths": selected,
+            "scope_base": scope_base,
+            "reason": runner_result.get("reason", ""),
+        },
     )
     if status is Status.PASS:
         _state_file(root, "review-budget.json").unlink(missing_ok=True)
@@ -131,12 +146,16 @@ def repair(root: Path) -> dict[str, Any]:
         return result("repair", Status.NOT_CONFIGURED, started, reason="run hermes-gate init")
     except ConfigError as exc:
         return result("repair", Status.ERROR, started, reason=f"invalid profile: {exc}")
-    selected = [path for path in scope_paths(root) if config.included(path)]
+    raw_selected, scope_base, scope_failure = _scope_or_error(root, "repair", started)
+    if scope_failure:
+        return scope_failure
+    assert raw_selected is not None and scope_base is not None
+    selected = [path for path in raw_selected if config.included(path)]
     if not selected:
         return result("repair", Status.NOT_APPLICABLE, started, reason="no changed files")
     if not config.repair:
         return result("repair", Status.NOT_CONFIGURED, started, reason="no [[repair]] command")
-    digest, failure = _digest_or_error(root, selected, "repair", started)
+    digest, failure = _digest_or_error(root, selected, "repair", started, base=scope_base)
     if failure:
         return failure
     state_path = _state_file(root, "repair-budget.json")
@@ -162,7 +181,7 @@ def repair(root: Path) -> dict[str, Any]:
     return result("repair", status, started, reason=reason, checks=checks)
 
 
-def review(root: Path) -> dict[str, Any]:
+def review(root: Path, *, base: str | None = None) -> dict[str, Any]:
     started = time.monotonic()
     try:
         config = load_config(root)
@@ -170,8 +189,12 @@ def review(root: Path) -> dict[str, Any]:
         return result("review", Status.NOT_CONFIGURED, started, reason="run hermes-gate init")
     except ConfigError as exc:
         return result("review", Status.ERROR, started, reason=f"invalid profile: {exc}")
-    selected = [path for path in scope_paths(root) if config.included(path)]
-    digest, failure = _digest_or_error(root, selected, "review", started)
+    raw_selected, scope_base, scope_failure = _scope_or_error(root, "review", started, base=base)
+    if scope_failure:
+        return scope_failure
+    assert raw_selected is not None and scope_base is not None
+    selected = [path for path in raw_selected if config.included(path)]
+    digest, failure = _digest_or_error(root, selected, "review", started, base=scope_base)
     if failure:
         return failure
     if not valid_receipt(root, "fast", digest):
@@ -196,7 +219,7 @@ def review(root: Path) -> dict[str, Any]:
         )
 
     provider_version = _tool_version(config.review.argv[0], root)
-    provider_argv = _provider_review_argv(config, root)
+    provider_argv = _provider_review_argv(config, root, base=scope_base)
     execution = run_argv(provider_argv, cwd=root, timeout_seconds=config.review.timeout_seconds)
     if execution.returncode not in {0, None}:
         normalized = normalize_coderabbit_output(
@@ -211,14 +234,29 @@ def review(root: Path) -> dict[str, Any]:
             material_categories=config.review.material_categories,
         )
     provider = config.review.provider
+    fallback_attempted = False
+    fallback_provider = ""
+    fallback_reason = ""
     if (
         execution.unavailable
         or execution.timed_out
         or normalized.status is Status.REVIEW_UNAVAILABLE
     ):
-        fallback = _fallback_review(config, root, digest)
+        fallback_argv = config.review.fallback_argv
+        if (
+            not fallback_argv
+            and shutil.which("hermes-pr-review")
+            and not changed_paths(root)
+            and _automatic_fallback_base(root, scope_base) is not None
+        ):
+            fallback_argv = ("hermes-pr-review",)
+        fallback_attempted = bool(fallback_argv)
+        fallback_provider = fallback_argv[0] if fallback_argv else ""
+        fallback = _fallback_review(config, root, digest, base=scope_base)
         if fallback is not None:
             execution, normalized, provider, provider_version = fallback
+        elif fallback_attempted:
+            fallback_reason = "fallback provider returned no usable review result"
     status = normalized.status
     findings = [asdict(item) for item in normalized.findings]
     reason = normalized.reason
@@ -242,7 +280,11 @@ def review(root: Path) -> dict[str, Any]:
             "provider": provider,
             "suppressed_count": normalized.suppressed_count,
             "reviewed_paths": selected,
+            "scope_base": scope_base,
             "reason": reason,
+            "fallback_attempted": fallback_attempted,
+            "fallback_provider": fallback_provider,
+            "fallback_reason": fallback_reason,
         },
     )
     return result("review", status, started, reason=reason, receipt=receipt, findings=findings)
@@ -250,19 +292,30 @@ def review(root: Path) -> dict[str, Any]:
 
 def boundary(root: Path, action: str) -> dict[str, Any]:
     started = time.monotonic()
-    raw_selected = staged_paths(root) if action == "commit" else scope_paths(root)
+    if action == "commit":
+        raw_selected = staged_paths(root)
+        scope_base = head(root)
+    else:
+        raw_selected, scope_base, scope_failure = _scope_or_error(root, "boundary", started)
+        if scope_failure:
+            return scope_failure
+        assert raw_selected is not None and scope_base is not None
+    try:
+        config = load_config(root)
+    except FileNotFoundError:
+        if not any(is_code_path(path) for path in raw_selected):
+            return result(
+                "boundary", Status.PASS, started, reason="non-code boundary is exempt", required=[]
+            )
+        return result("boundary", Status.NOT_CONFIGURED, started, reason="run hermes-gate init")
+    except ConfigError as exc:
+        return result("boundary", Status.ERROR, started, reason=f"invalid profile: {exc}")
     if not any(is_code_path(path) for path in raw_selected):
         return result(
             "boundary", Status.PASS, started, reason="non-code boundary is exempt", required=[]
         )
-    try:
-        config = load_config(root)
-    except FileNotFoundError:
-        return result("boundary", Status.NOT_CONFIGURED, started, reason="run hermes-gate init")
-    except ConfigError as exc:
-        return result("boundary", Status.ERROR, started, reason=f"invalid profile: {exc}")
     selected = [path for path in raw_selected if config.included(path)]
-    digest, failure = _digest_or_error(root, selected, "boundary", started)
+    digest, failure = _digest_or_error(root, selected, "boundary", started, base=scope_base)
     if failure:
         return failure
     requirements = ["fast"]
@@ -296,17 +349,36 @@ def _receipt_covers(root: Path, kind: str, selected: list[str]) -> bool:
     if not receipt or not set(selected).issubset(set(checked)):
         return False
     try:
-        digest = diff_digest(root, checked)
+        base = receipt.get("scope_base")
+        digest = diff_digest(root, checked, base=base if isinstance(base, str) else None)
     except ContentReadError:
         return False
     return valid_receipt(root, kind, digest) is not None
 
 
+def _scope_or_error(
+    root: Path,
+    command: str,
+    started: float,
+    *,
+    files: list[str] | None = None,
+    base: str | None = None,
+) -> tuple[list[str] | None, str | None, dict[str, Any] | None]:
+    try:
+        if files is not None:
+            _, resolved_base = scope(root, base=base)
+            return files, resolved_base, None
+        selected, resolved_base = scope(root, base=base)
+        return selected, resolved_base, None
+    except ScopeError as exc:
+        return None, None, result(command, Status.ERROR, started, reason=str(exc))
+
+
 def _digest_or_error(
-    root: Path, selected: list[str], kind: str, started: float
+    root: Path, selected: list[str], kind: str, started: float, *, base: str | None
 ) -> tuple[str | None, dict[str, Any] | None]:
     try:
-        return diff_digest(root, selected), None
+        return diff_digest(root, selected, base=base), None
     except ContentReadError as exc:
         return None, result(
             kind,
@@ -406,12 +478,33 @@ def _execution_dict(execution: Execution, name: str) -> dict[str, Any]:
     }
 
 
-def _fallback_review(config: GateConfig, root: Path, digest: str):
+def _automatic_fallback_base(root: Path, base: str | None) -> str | None:
+    """Return a non-empty committed comparison base for the automatic fallback."""
+    if base is None:
+        resolved = git(root, "rev-parse", "HEAD^", check=False)
+    else:
+        resolved = git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}", check=False)
+    if resolved.returncode:
+        return None
+    exact_base = resolved.stdout.decode().strip()
+    diff = git(root, "diff", "--quiet", exact_base, "HEAD", "--", check=False)
+    return exact_base if diff.returncode == 1 else None
+
+
+def _fallback_review(
+    config: GateConfig, root: Path, digest: str, *, base: str | None = None
+):
     argv = config.review.fallback_argv
+    environment: dict[str, str] | None = None
+    if base is not None:
+        resolved = git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}", check=False)
+        if resolved.returncode:
+            return None
+        environment = {"HERMES_GATE_BASE": resolved.stdout.decode().strip()}
     output_dir: Path | None = None
     if not argv and shutil.which("hermes-pr-review") and not changed_paths(root):
-        parent = git(root, "rev-parse", "HEAD^", check=False)
-        if parent.returncode:
+        fallback_base = _automatic_fallback_base(root, base)
+        if fallback_base is None:
             return None
         output_dir = git_dir(root) / "hermes-gate" / "providers" / "hermes-pr-review" / digest
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -420,7 +513,7 @@ def _fallback_review(config: GateConfig, root: Path, digest: str):
             "--repo",
             str(root),
             "--base",
-            parent.stdout.decode().strip(),
+            fallback_base,
             "--output-dir",
             str(output_dir),
             "--run-codex",
@@ -433,7 +526,9 @@ def _fallback_review(config: GateConfig, root: Path, digest: str):
         )
     if not argv:
         return None
-    execution = run_argv(argv, cwd=root, timeout_seconds=config.review.timeout_seconds + 5)
+    execution = run_argv(
+        argv, cwd=root, timeout_seconds=config.review.timeout_seconds + 5, env=environment
+    )
     if execution.unavailable or execution.timed_out:
         return None
     if output_dir is not None:
@@ -476,11 +571,46 @@ def _fallback_review(config: GateConfig, root: Path, digest: str):
     return execution, normalized, name, _tool_version(name, root)
 
 
-def _provider_review_argv(config: GateConfig, root: Path) -> tuple[str, ...]:
+def _provider_review_argv(
+    config: GateConfig, root: Path, *, base: str | None = None
+) -> tuple[str, ...]:
     """Bind CodeRabbit to the exact local dirty or committed boundary."""
     argv = tuple(config.review.argv)
+    if config.review.provider != "coderabbit":
+        return argv
+    if base is not None:
+        resolved = git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}", check=False)
+        if resolved.returncode:
+            return argv
+        exact_base = resolved.stdout.decode().strip()
+        rewritten: list[str] = []
+        seen_committed = False
+        skip_base_value = False
+        dirty = bool(changed_paths(root))
+        for item in argv:
+            if skip_base_value:
+                skip_base_value = False
+                continue
+            if item == "--base-commit":
+                skip_base_value = True
+                continue
+            if item.startswith("--base-commit=") or item == "--uncommitted":
+                continue
+            if item == "--committed":
+                if dirty:
+                    continue
+                if seen_committed:
+                    continue
+                seen_committed = True
+            rewritten.append(item)
+        if dirty:
+            if "--include-untracked" not in rewritten:
+                rewritten.append("--include-untracked")
+        elif not seen_committed:
+            rewritten.append("--committed")
+        return (*rewritten, "--base-commit", exact_base)
     boundary_flags = ("--base", "--base-commit", "--committed", "--uncommitted")
-    if config.review.provider != "coderabbit" or any(
+    if any(
         item == flag or item.startswith(f"{flag}=") for item in argv for flag in boundary_flags
     ):
         return argv
