@@ -651,6 +651,126 @@ def test_review_nonzero_exit_never_creates_pass_receipt(repo: Path) -> None:
     assert review(repo)["status"] == "REVIEW_UNAVAILABLE"
 
 
+def test_review_receipt_preserves_unusable_fallback_metadata(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_profile(repo)
+    git(repo, "add", ".hermes/gate.toml")
+    git(repo, "commit", "-qm", "profile")
+    profile_path = repo / ".hermes" / "gate.toml"
+    fallback_argv = [sys.executable, "-c", "print('{\"type\":\"error\"}')"]
+    profile = profile_path.read_text(encoding="utf-8").replace(
+        "fallback_argv = []", f"fallback_argv = {json.dumps(fallback_argv)}"
+    )
+    profile_path.write_text(profile, encoding="utf-8")
+    (repo / "source.py").write_text("ok = True\n", encoding="utf-8")
+    assert fast(repo)["status"] == "PASS"
+    calls: list[tuple[str, ...]] = []
+
+    def provider(argv: tuple[str, ...], **kwargs: object) -> Execution:
+        calls.append(argv)
+        return Execution(argv, 0, 0, '{"type":"error"}\n', "")
+
+    monkeypatch.setattr("hermes_gate.engine.run_argv", provider)
+    outcome = review(repo)
+
+    assert outcome["status"] == "REVIEW_UNAVAILABLE"
+    receipt = outcome["receipt"]
+    assert receipt["fallback_attempted"] is True
+    assert receipt["fallback_provider"] == sys.executable
+    assert receipt["fallback_reason"]
+    assert any(argv[0] == sys.executable for argv in calls)
+
+
+def test_review_skips_automatic_fallback_for_empty_comparison(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_profile(repo)
+    (repo / "source.py").write_text("ok = True\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "only commit")
+    assert fast(repo)["status"] == "PASS"
+    calls: list[tuple[str, ...]] = []
+
+    def provider(argv: tuple[str, ...], **kwargs: object) -> Execution:
+        calls.append(argv)
+        return Execution(argv, 0, 0, '{"type":"error"}\n', "")
+
+    monkeypatch.setattr("hermes_gate.engine.shutil.which", lambda _: "/usr/bin/hermes-pr-review")
+    monkeypatch.setattr("hermes_gate.engine._tool_version", lambda *args, **kwargs: "test")
+    monkeypatch.setattr("hermes_gate.engine.run_argv", provider)
+    outcome = review(repo)
+
+    assert outcome["status"] == "REVIEW_UNAVAILABLE"
+    assert not any(argv[0] == "hermes-pr-review" for argv in calls)
+    assert calls[-1][0] == "coderabbit"
+    assert outcome["receipt"]["fallback_attempted"] is False
+    assert outcome["receipt"]["fallback_provider"] == ""
+    assert outcome["receipt"]["fallback_reason"] == ""
+
+
+def test_review_runs_automatic_fallback_for_nonempty_comparison(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_profile(repo)
+    source = repo / "source.py"
+    source.write_text("value = 'base'\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "base")
+    base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    source.write_text("value = 'head'\n", encoding="utf-8")
+    git(repo, "commit", "-am", "head")
+    assert fast(repo, base=base)["status"] == "PASS"
+    calls: list[tuple[str, ...]] = []
+
+    def provider(argv: tuple[str, ...], **kwargs: object) -> Execution:
+        calls.append(argv)
+        if argv[0] == "hermes-pr-review":
+            output_dir = Path(argv[argv.index("--output-dir") + 1])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "review.json").write_text(
+                '{"verdict":"PASS","findings":[]}\n', encoding="utf-8"
+            )
+            return Execution(argv, 0, 0, "", "")
+        return Execution(argv, 0, 0, '{"type":"error"}\n', "")
+
+    monkeypatch.setattr("hermes_gate.engine.shutil.which", lambda _: "/usr/bin/hermes-pr-review")
+    monkeypatch.setattr("hermes_gate.engine._tool_version", lambda *args, **kwargs: "test")
+    monkeypatch.setattr("hermes_gate.engine.run_argv", provider)
+    outcome = review(repo, base=base)
+
+    assert outcome["status"] == "PASS"
+    fallback_call = next(argv for argv in calls if argv[0] == "hermes-pr-review")
+    assert fallback_call[fallback_call.index("--base") + 1] == base
+    assert outcome["receipt"]["provider"] == "hermes-pr-review"
+    assert outcome["receipt"]["fallback_attempted"] is True
+    assert outcome["receipt"]["fallback_provider"] == "hermes-pr-review"
+    assert outcome["receipt"]["fallback_reason"] == ""
+
+
+def test_boundary_rejects_invalid_profile_for_non_code_commit(repo: Path) -> None:
+    write_profile(repo)
+    profile_path = repo / ".hermes" / "gate.toml"
+    profile_path.write_text(
+        profile_path.read_text(encoding="utf-8").replace(
+            'provider = "coderabbit"', 'provider = "hermes-pr-review"'
+        ),
+        encoding="utf-8",
+    )
+    (repo / "README.md").write_text("documentation only\n", encoding="utf-8")
+    git(repo, "add", "README.md")
+
+    outcome = boundary(repo, "commit")
+
+    assert outcome["status"] == "ERROR"
+    assert outcome["reason"].startswith("invalid profile:")
+
+
 def test_review_unavailable_does_not_consume_semantic_attempt(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

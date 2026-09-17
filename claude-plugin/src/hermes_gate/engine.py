@@ -234,14 +234,25 @@ def review(root: Path, *, base: str | None = None) -> dict[str, Any]:
             material_categories=config.review.material_categories,
         )
     provider = config.review.provider
+    fallback_attempted = False
+    fallback_provider = ""
+    fallback_reason = ""
     if (
         execution.unavailable
         or execution.timed_out
         or normalized.status is Status.REVIEW_UNAVAILABLE
     ):
+        fallback_argv = config.review.fallback_argv
+        if not fallback_argv and shutil.which("hermes-pr-review") and not changed_paths(root):
+            if _automatic_fallback_base(root, scope_base) is not None:
+                fallback_argv = ("hermes-pr-review",)
+        fallback_attempted = bool(fallback_argv)
+        fallback_provider = fallback_argv[0] if fallback_argv else ""
         fallback = _fallback_review(config, root, digest, base=scope_base)
         if fallback is not None:
             execution, normalized, provider, provider_version = fallback
+        elif fallback_attempted:
+            fallback_reason = "fallback provider returned no usable review result"
     status = normalized.status
     findings = [asdict(item) for item in normalized.findings]
     reason = normalized.reason
@@ -267,6 +278,9 @@ def review(root: Path, *, base: str | None = None) -> dict[str, Any]:
             "reviewed_paths": selected,
             "scope_base": scope_base,
             "reason": reason,
+            "fallback_attempted": fallback_attempted,
+            "fallback_provider": fallback_provider,
+            "fallback_reason": fallback_reason,
         },
     )
     return result("review", status, started, reason=reason, receipt=receipt, findings=findings)
@@ -282,16 +296,20 @@ def boundary(root: Path, action: str) -> dict[str, Any]:
         if scope_failure:
             return scope_failure
         assert raw_selected is not None and scope_base is not None
+    try:
+        config = load_config(root)
+    except FileNotFoundError:
+        if not any(is_code_path(path) for path in raw_selected):
+            return result(
+                "boundary", Status.PASS, started, reason="non-code boundary is exempt", required=[]
+            )
+        return result("boundary", Status.NOT_CONFIGURED, started, reason="run hermes-gate init")
+    except ConfigError as exc:
+        return result("boundary", Status.ERROR, started, reason=f"invalid profile: {exc}")
     if not any(is_code_path(path) for path in raw_selected):
         return result(
             "boundary", Status.PASS, started, reason="non-code boundary is exempt", required=[]
         )
-    try:
-        config = load_config(root)
-    except FileNotFoundError:
-        return result("boundary", Status.NOT_CONFIGURED, started, reason="run hermes-gate init")
-    except ConfigError as exc:
-        return result("boundary", Status.ERROR, started, reason=f"invalid profile: {exc}")
     selected = [path for path in raw_selected if config.included(path)]
     digest, failure = _digest_or_error(root, selected, "boundary", started, base=scope_base)
     if failure:
@@ -456,6 +474,19 @@ def _execution_dict(execution: Execution, name: str) -> dict[str, Any]:
     }
 
 
+def _automatic_fallback_base(root: Path, base: str | None) -> str | None:
+    """Return a non-empty committed comparison base for the automatic fallback."""
+    if base is None:
+        resolved = git(root, "rev-parse", "HEAD^", check=False)
+    else:
+        resolved = git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}", check=False)
+    if resolved.returncode:
+        return None
+    exact_base = resolved.stdout.decode().strip()
+    diff = git(root, "diff", "--quiet", exact_base, "HEAD", "--", check=False)
+    return exact_base if diff.returncode == 1 else None
+
+
 def _fallback_review(
     config: GateConfig, root: Path, digest: str, *, base: str | None = None
 ):
@@ -468,17 +499,9 @@ def _fallback_review(
         environment = {"HERMES_GATE_BASE": resolved.stdout.decode().strip()}
     output_dir: Path | None = None
     if not argv and shutil.which("hermes-pr-review") and not changed_paths(root):
-        fallback_base = base
+        fallback_base = _automatic_fallback_base(root, base)
         if fallback_base is None:
-            parent = git(root, "rev-parse", "HEAD^", check=False)
-            if parent.returncode:
-                return None
-            fallback_base = parent.stdout.decode().strip()
-        else:
-            resolved = git(root, "rev-parse", "--verify", "--quiet", f"{fallback_base}^{{commit}}", check=False)
-            if resolved.returncode:
-                return None
-            fallback_base = resolved.stdout.decode().strip()
+            return None
         output_dir = git_dir(root) / "hermes-gate" / "providers" / "hermes-pr-review" / digest
         output_dir.mkdir(parents=True, exist_ok=True)
         argv = (
