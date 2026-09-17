@@ -13,6 +13,7 @@ import pytest
 from hermes_gate.cli import main as cli_main
 from hermes_gate.config import ConfigError, load_config
 from hermes_gate.engine import (
+    _fallback_review,
     _provider_review_argv,
     _state_file,
     _tool_version,
@@ -349,6 +350,41 @@ def test_fast_receipt_is_not_reused_across_explicit_bases(repo: Path) -> None:
     assert second["receipt"]["scope_base"] == second_base
     assert first["receipt"]["diff_sha256"] != second["receipt"]["diff_sha256"]
     assert second.get("cached") is None
+
+
+def test_configured_fallback_receives_resolved_base(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write_profile(repo)
+    source = repo / "source.py"
+    source.write_text("value = 'base'\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "base")
+    base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    source.write_text("value = 'head'\n", encoding="utf-8")
+    git(repo, "commit", "-am", "head")
+    profile_path = repo / ".hermes" / "gate.toml"
+    profile_path.write_text(
+        profile_path.read_text(encoding="utf-8").replace(
+            "fallback_argv = []", f"fallback_argv = {json.dumps([sys.executable, '-c', 'pass'])}"
+        ),
+        encoding="utf-8",
+    )
+    calls: list[dict[str, object]] = []
+
+    def fallback(argv: tuple[str, ...], **kwargs: object) -> Execution:
+        calls.append(kwargs)
+        return Execution(argv, 0, 0, '{"type":"complete"}\n', "")
+
+    monkeypatch.setattr("hermes_gate.engine.run_argv", fallback)
+
+    outcome = _fallback_review(load_config(repo), repo, "digest", base=base)
+
+    assert outcome is not None
+    assert any(call.get("env") == {"HERMES_GATE_BASE": base} for call in calls)
 
 
 def test_snapshot_binds_symlink_identity_and_target_bytes(repo: Path) -> None:

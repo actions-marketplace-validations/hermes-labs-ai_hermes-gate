@@ -77,6 +77,12 @@ def scope(root: Path, *, base: str | None = None) -> tuple[list[str], str]:
     dirty = changed_paths(root)
     if dirty:
         if base is None:
+            upstream = git(
+                root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False
+            )
+            parents = git(root, "rev-list", "--parents", "-n", "1", "HEAD", check=False)
+            if upstream.returncode and parents.returncode == 0 and len(parents.stdout.split()) > 2:
+                raise ScopeError("scope unresolved: HEAD is a merge commit with no upstream or --base")
             return dirty, head(root)
         resolved = _resolve_base(root, base)
         committed = _diff_names(root, resolved, "HEAD")
@@ -189,7 +195,10 @@ def session_changed_paths(root: Path, baseline: dict[str, str] | None) -> list[s
 def diff_digest(
     root: Path, paths: Iterable[str] | None = None, *, base: str | None = None
 ) -> str:
-    selected = list(paths) if paths is not None else scope_paths(root)
+    if paths is None and base is None:
+        selected, base = scope(root)
+    else:
+        selected = list(paths) if paths is not None else scope_paths(root, base=base)
     payload = {
         "base": base,
         "repo": str(root.resolve()),

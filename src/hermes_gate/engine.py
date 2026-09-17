@@ -460,6 +460,12 @@ def _fallback_review(
     config: GateConfig, root: Path, digest: str, *, base: str | None = None
 ):
     argv = config.review.fallback_argv
+    environment: dict[str, str] | None = None
+    if base is not None:
+        resolved = git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}", check=False)
+        if resolved.returncode:
+            return None
+        environment = {"HERMES_GATE_BASE": resolved.stdout.decode().strip()}
     output_dir: Path | None = None
     if not argv and shutil.which("hermes-pr-review") and not changed_paths(root):
         fallback_base = base
@@ -493,7 +499,9 @@ def _fallback_review(
         )
     if not argv:
         return None
-    execution = run_argv(argv, cwd=root, timeout_seconds=config.review.timeout_seconds + 5)
+    execution = run_argv(
+        argv, cwd=root, timeout_seconds=config.review.timeout_seconds + 5, env=environment
+    )
     if execution.unavailable or execution.timed_out:
         return None
     if output_dir is not None:
@@ -559,7 +567,7 @@ def _provider_review_argv(
             if item == "--base-commit":
                 skip_base_value = True
                 continue
-            if item.startswith("--base-commit=") or (item == "--uncommitted" and not dirty):
+            if item.startswith("--base-commit=") or item == "--uncommitted":
                 continue
             if item == "--committed":
                 if dirty:
