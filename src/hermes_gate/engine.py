@@ -366,7 +366,7 @@ def _scope_or_error(
 ) -> tuple[list[str] | None, str | None, dict[str, Any] | None]:
     try:
         if files is not None:
-            _, resolved_base = scope(root, base=base) if base is not None else ([], head(root))
+            _, resolved_base = scope(root, base=base)
             return files, resolved_base, None
         selected, resolved_base = scope(root, base=base)
         return selected, resolved_base, None

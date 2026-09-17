@@ -187,6 +187,12 @@ def test_fast_refuses_detached_merge_without_upstream_or_base(
     assert unresolved["reason"] == "scope unresolved: HEAD is a merge commit with no upstream or --base"
     assert read_receipt(repo, "fast") is None
 
+    explicit_unresolved = fast(repo, files=["feature.py"])
+
+    assert explicit_unresolved["status"] == "ERROR"
+    assert explicit_unresolved["reason"] == unresolved["reason"]
+    assert read_receipt(repo, "fast") is None
+
     resolved = fast(repo, base=base)
 
     assert resolved["status"] == "PASS"
