@@ -24,6 +24,7 @@ from .gitstate import (
     scope,
     staged_paths,
 )
+from .init_repo import is_adopted
 from .providers import normalize_coderabbit_output
 from .receipts import read_receipt, valid_receipt, write_receipt
 from .repo_runner import run as run_repository
@@ -306,6 +307,14 @@ def boundary(root: Path, action: str) -> dict[str, Any]:
         if not any(is_code_path(path) for path in raw_selected):
             return result(
                 "boundary", Status.PASS, started, reason="non-code boundary is exempt", required=[]
+            )
+        if not is_adopted(root):
+            return result(
+                "boundary",
+                Status.PASS,
+                started,
+                reason="repository is outside the Gate rail",
+                required=[],
             )
         return result("boundary", Status.NOT_CONFIGURED, started, reason="run hermes-gate init")
     except ConfigError as exc:
