@@ -243,9 +243,13 @@ def review(root: Path, *, base: str | None = None) -> dict[str, Any]:
         or normalized.status is Status.REVIEW_UNAVAILABLE
     ):
         fallback_argv = config.review.fallback_argv
-        if not fallback_argv and shutil.which("hermes-pr-review") and not changed_paths(root):
-            if _automatic_fallback_base(root, scope_base) is not None:
-                fallback_argv = ("hermes-pr-review",)
+        if (
+            not fallback_argv
+            and shutil.which("hermes-pr-review")
+            and not changed_paths(root)
+            and _automatic_fallback_base(root, scope_base) is not None
+        ):
+            fallback_argv = ("hermes-pr-review",)
         fallback_attempted = bool(fallback_argv)
         fallback_provider = fallback_argv[0] if fallback_argv else ""
         fallback = _fallback_review(config, root, digest, base=scope_base)
