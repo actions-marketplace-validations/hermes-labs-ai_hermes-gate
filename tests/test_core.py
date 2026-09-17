@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from hermes_gate.config import ConfigError, load_config
 from hermes_gate.cli import main as cli_main
+from hermes_gate.config import ConfigError, load_config
 from hermes_gate.engine import (
     _provider_review_argv,
     _state_file,
