@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from hermes_gate.config import ConfigError, load_config
+from hermes_gate.cli import main as cli_main
 from hermes_gate.engine import (
     _provider_review_argv,
     _state_file,
@@ -148,6 +149,72 @@ def test_execution_tolerates_process_group_exiting_before_term(
     assert result.returncode is None
 
 
+def test_fast_refuses_detached_merge_without_upstream_or_base(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_profile(repo)
+    base_branch = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--show-current"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repo / "shared.py").write_text("base = True\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "base")
+    git(repo, "checkout", "-qb", "feature")
+    (repo / "feature.py").write_text("feature = True\n", encoding="utf-8")
+    git(repo, "add", "feature.py")
+    git(repo, "commit", "-qm", "feature change")
+    git(repo, "checkout", base_branch)
+    (repo / "base_only.py").write_text("base_only = True\n", encoding="utf-8")
+    git(repo, "add", "base_only.py")
+    git(repo, "commit", "-qm", "base change")
+    base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    git(repo, "checkout", "feature")
+    git(repo, "merge", "--no-ff", base_branch, "-m", "sync base")
+    git(repo, "checkout", "--detach")
+
+    unresolved = fast(repo)
+
+    assert unresolved["status"] == "ERROR"
+    assert unresolved["reason"] == "scope unresolved: HEAD is a merge commit with no upstream or --base"
+    assert read_receipt(repo, "fast") is None
+
+    resolved = fast(repo, base=base)
+
+    assert resolved["status"] == "PASS"
+    assert resolved["receipt"]["checked_paths"] == ["feature.py"]
+
+    (repo / "dirty.py").write_text("dirty = True\n", encoding="utf-8")
+    with_dirty = fast(repo, base=base)
+    assert with_dirty["status"] == "PASS"
+    assert with_dirty["receipt"]["checked_paths"] == ["dirty.py", "feature.py"]
+
+    profile_path = repo / ".hermes" / "gate.toml"
+    profile_path.write_text(
+        profile_path.read_text(encoding="utf-8").replace(
+            'argv = ["coderabbit", "review", "--agent"]',
+            'argv = ["coderabbit", "review", "--agent", "--base", "main", "--base-commit", "deadbeef"]',
+        ),
+        encoding="utf-8",
+    )
+    provider_argv = _provider_review_argv(load_config(repo), repo, base=base)
+    assert provider_argv[-3:] == ("--include-untracked", "--base-commit", base)
+    assert "--committed" not in provider_argv
+    assert "deadbeef" not in provider_argv
+
+    monkeypatch.chdir(repo)
+    assert cli_main(["fast", "--base", base]) == 0
+    monkeypatch.setenv("HERMES_GATE_BASE", base)
+    assert cli_main(["fast"]) == 0
+
+
 def test_copied_runner_timeout_kills_process_group(tmp_path: Path) -> None:
     marker = tmp_path / "runner-descendant-survived"
     child_code = (
@@ -249,6 +316,39 @@ def test_fast_receipt_is_cached_and_invalidated_after_edit(repo: Path) -> None:
     assert valid_receipt(repo, "fast", diff_digest(repo)) is None
     third = fast(repo)
     assert third["receipt"]["diff_sha256"] != original_digest
+
+
+def test_fast_receipt_is_not_reused_across_explicit_bases(repo: Path) -> None:
+    write_profile(repo)
+    source = repo / "source.py"
+    source.write_text("value = 'one'\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "first base")
+    first_base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    source.write_text("value = 'two'\n", encoding="utf-8")
+    git(repo, "commit", "-am", "second base")
+    second_base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    source.write_text("value = 'current'\n", encoding="utf-8")
+    git(repo, "commit", "-am", "current")
+
+    first = fast(repo, files=["source.py"], base=first_base)
+    second = fast(repo, files=["source.py"], base=second_base)
+
+    assert first["status"] == second["status"] == "PASS"
+    assert first["receipt"]["scope_base"] == first_base
+    assert second["receipt"]["scope_base"] == second_base
+    assert first["receipt"]["diff_sha256"] != second["receipt"]["diff_sha256"]
+    assert second.get("cached") is None
 
 
 def test_snapshot_binds_symlink_identity_and_target_bytes(repo: Path) -> None:

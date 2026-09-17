@@ -13,6 +13,10 @@ class GitError(RuntimeError):
     pass
 
 
+class ScopeError(GitError):
+    """The committed scope cannot be selected without risking a false PASS."""
+
+
 class ContentReadError(RuntimeError):
     """A path advertised bytes that could not be read faithfully."""
 
@@ -68,25 +72,50 @@ def staged_paths(root: Path) -> list[str]:
     )
 
 
-def scope_paths(root: Path) -> list[str]:
-    """Current dirty paths, otherwise committed paths since upstream or parent."""
+def scope(root: Path, *, base: str | None = None) -> tuple[list[str], str]:
+    """Return changed paths and the exact commit that defines their comparison boundary."""
     dirty = changed_paths(root)
     if dirty:
-        return dirty
+        if base is None:
+            return dirty, head(root)
+        resolved = _resolve_base(root, base)
+        committed = _diff_names(root, resolved, "HEAD")
+        return sorted(set(committed) | set(dirty)), resolved
+    if base is not None:
+        resolved = _resolve_base(root, base)
+        return _diff_names(root, resolved, "HEAD"), resolved
     upstream = git(
         root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False
     )
     if upstream.returncode == 0:
         base = git(root, "merge-base", "HEAD", upstream.stdout.decode().strip(), check=False)
         if base.returncode == 0:
-            return _diff_names(root, base.stdout.decode().strip(), "HEAD")
+            resolved = base.stdout.decode().strip()
+            return _diff_names(root, resolved, "HEAD"), resolved
+    parents = git(root, "rev-list", "--parents", "-n", "1", "HEAD", check=False)
+    if parents.returncode == 0 and len(parents.stdout.split()) > 2:
+        raise ScopeError("scope unresolved: HEAD is a merge commit with no upstream or --base")
     parent = git(root, "rev-parse", "HEAD^", check=False)
     if parent.returncode == 0:
-        return _diff_names(root, parent.stdout.decode().strip(), "HEAD")
+        resolved = parent.stdout.decode().strip()
+        return _diff_names(root, resolved, "HEAD"), resolved
     tracked = git(root, "ls-files", "-z", check=False)
-    return sorted(
-        item.decode("utf-8", "surrogateescape") for item in tracked.stdout.split(b"\0") if item
+    return (
+        sorted(item.decode("utf-8", "surrogateescape") for item in tracked.stdout.split(b"\0") if item),
+        head(root),
     )
+
+
+def scope_paths(root: Path, *, base: str | None = None) -> list[str]:
+    """Current dirty paths, otherwise committed paths since an explicit base, upstream, or parent."""
+    return scope(root, base=base)[0]
+
+
+def _resolve_base(root: Path, base: str) -> str:
+    resolved = git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}", check=False)
+    if resolved.returncode:
+        raise ScopeError(f"scope unresolved: --base {base!r} is not a commit")
+    return resolved.stdout.decode().strip()
 
 
 def _diff_names(root: Path, base: str, target: str) -> list[str]:
@@ -157,9 +186,12 @@ def session_changed_paths(root: Path, baseline: dict[str, str] | None) -> list[s
     return sorted(path for path, digest in current.items() if baseline.get(path) != digest)
 
 
-def diff_digest(root: Path, paths: Iterable[str] | None = None) -> str:
+def diff_digest(
+    root: Path, paths: Iterable[str] | None = None, *, base: str | None = None
+) -> str:
     selected = list(paths) if paths is not None else scope_paths(root)
     payload = {
+        "base": base,
         "repo": str(root.resolve()),
         "paths": snapshot(root, selected),
     }
