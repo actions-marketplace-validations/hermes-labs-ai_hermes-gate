@@ -406,6 +406,18 @@ def _manifest_path_for_read(root: Path) -> Path:
     return current if current.exists() else legacy
 
 
+def is_adopted(root: Path) -> bool:
+    """Whether this repository has a Gate installation manifest.
+
+    A profile alone is enough to activate the rail, but its absence is
+    ambiguous: it can mean either that a repository was never enrolled or
+    that an enrolled repository lost its generated profile.  `initialize()`
+    writes this manifest and `uninstall()` removes it, so it is the durable
+    enrollment witness for that distinction.
+    """
+    return _manifest_path_for_read(root).is_file()
+
+
 def _has_test_extra(path: Path) -> bool:
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))

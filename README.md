@@ -71,8 +71,12 @@ hermes-gate full
 hermes-gate boundary commit
 ```
 
-The boundary command only verifies configured receipts. It never performs the Git
-operation or grants owner authorization.
+The boundary command verifies configured receipts. Repositories that have never
+been adopted (no profile and no Gate install manifest) are outside this rail and
+pass the boundary unchanged; do not run `init` merely to satisfy a global hook.
+An adopted repository with a missing profile remains fail-closed until its
+profile is restored or `uninstall-repo` completes. The boundary never performs
+the Git operation or grants owner authorization.
 
 ## CLI
 
@@ -178,7 +182,7 @@ event handlers used by the manual Claude integration above:
 |---|---|---|
 | `SessionStart` | `session-start` | Injects the compact completion contract as additional context. Always continues. |
 | `Stop` | `stop` | Runs the cached fast gate against session-changed code paths and reports a non-PASS reason as an advisory `systemMessage`. Never blocks. |
-| `PreToolUse` (matcher `Bash`) | `pre-tool-use` | Denies a detected commit/push/PR boundary command that is missing its matching receipt; otherwise stays silent. |
+| `PreToolUse` (matcher `Bash`) | `pre-tool-use` | Denies a detected commit/push/PR boundary command that is missing its matching receipt in an adopted repository; never-adopted repositories stay outside the rail. |
 
 Every path fails open: a malformed payload, an unrecognized event, or an
 internal error returns `{"continue": true}` rather than blocking the
