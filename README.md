@@ -39,6 +39,21 @@ instead. Release builds verify the tag, package and runner versions, tracked
 runner, distribution metadata, and packaged source bytes before upload; they also reject versions
 superseded on PyPI after environment approval.
 
+### Time-limited distribution exception
+
+The v0.1.6 release carries one direct, twelve-hour exception record for its
+[Hermes Registry submission](https://github.com/hermesonehq/hermes-registry/pull/5).
+It can be inspected locally with:
+
+```bash
+python scripts/verify_release.py --tag v0.1.6 \
+  --distribution-exception release/distribution-exceptions/v0.1.6-hermes-registry.json
+```
+
+The command expires automatically at the recorded UTC time. It is not used by
+the publish workflow and never bypasses the normal source, runner, tag, package,
+or artifact identity checks.
+
 `init` detects repository-native Python or JavaScript commands and writes a
 reviewable `.hermes/gate.toml`, a checksum-bound stdlib runner, and a CI
 workflow. Existing integration files are not overwritten unless

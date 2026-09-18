@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import shutil
 import subprocess
 import sys
@@ -9,6 +10,7 @@ import tarfile
 import tomllib
 import zipfile
 from pathlib import Path
+from datetime import UTC, datetime
 
 import pytest
 
@@ -20,6 +22,9 @@ assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 ReleaseError = MODULE.ReleaseError
+
+EXCEPTION = ROOT / "release" / "distribution-exceptions" / "v0.1.6-hermes-registry.json"
+ACTIVE_EXCEPTION_TIME = datetime(2026, 9, 18, 0, 29, tzinfo=UTC)
 
 
 @pytest.fixture(scope="module")
@@ -62,6 +67,56 @@ def test_release_identity_rejects_tracked_runner_drift(built_dist: Path, tmp_pat
     tracked.write_text(tracked.read_text() + "\n# stale copy\n", encoding="utf-8")
     with pytest.raises(ReleaseError, match="tracked .hermes runner must match"):
         MODULE.verify(root, TAG)
+
+
+def test_distribution_exception_accepts_only_active_exact_v016_record() -> None:
+    assert "PASS:" in MODULE.verify_distribution_exception(
+        EXCEPTION, "v0.1.6", now=ACTIVE_EXCEPTION_TIME
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("release_tag", "v0.1.5", "unexpected release_tag"),
+        ("expires_at", "2026-09-18T12:28:12Z", "exactly 12 hours"),
+        ("submission_url", "https://example.test/pr/5", "unexpected submission_url"),
+    ],
+)
+def test_distribution_exception_rejects_wrong_record_fields(
+    tmp_path: Path, field: str, value: str, message: str
+) -> None:
+    record = json.loads(EXCEPTION.read_text(encoding="utf-8"))
+    record[field] = value
+    path = tmp_path / "exception.json"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    with pytest.raises(ReleaseError, match=message):
+        MODULE.verify_distribution_exception(path, TAG, now=ACTIVE_EXCEPTION_TIME)
+
+
+def test_distribution_exception_rejects_expiration_and_wrong_requested_tag() -> None:
+    with pytest.raises(ReleaseError, match="not yet active"):
+        MODULE.verify_distribution_exception(
+            EXCEPTION, TAG, now=datetime(2026, 9, 18, 0, 28, 10, tzinfo=UTC)
+        )
+    assert "PASS:" in MODULE.verify_distribution_exception(
+        EXCEPTION, TAG, now=datetime(2026, 9, 18, 0, 28, 11, tzinfo=UTC)
+    )
+    with pytest.raises(ReleaseError, match="expired"):
+        MODULE.verify_distribution_exception(
+            EXCEPTION, TAG, now=datetime(2026, 9, 18, 12, 28, 11, tzinfo=UTC)
+        )
+    with pytest.raises(ReleaseError, match="not 'v0.1.5'"):
+        MODULE.verify_distribution_exception(EXCEPTION, "v0.1.5", now=ACTIVE_EXCEPTION_TIME)
+
+
+def test_distribution_exception_never_bypasses_identity_failure(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    shutil.copytree(ROOT, root)
+    init = root / "src" / "hermes_gate" / "__init__.py"
+    init.write_text(init.read_text().replace(f'"{VERSION}"', '"9.9.9"'), encoding="utf-8")
+    with pytest.raises(ReleaseError, match="__version__"):
+        MODULE.verify(root, TAG, distribution_exception=EXCEPTION)
 
 
 def test_release_identity_rejects_extra_or_mislabeled_artifacts(

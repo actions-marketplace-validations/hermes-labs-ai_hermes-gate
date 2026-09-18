@@ -6,15 +6,68 @@ from __future__ import annotations
 import argparse
 import ast
 import configparser
+import json
 import tarfile
 import tomllib
 import zipfile
+from datetime import UTC, datetime, timedelta
 from email.parser import BytesParser
 from pathlib import Path
 
 
 class ReleaseError(ValueError):
     """The release identity is incomplete or inconsistent."""
+
+
+_V016_HERMES_REGISTRY_EXCEPTION = {
+    "schema_version": 1,
+    "release_tag": "v0.1.6",
+    "surface": "Hermes Registry",
+    "target": "hermesonehq/hermes-registry",
+    "submission_url": "https://github.com/hermesonehq/hermes-registry/pull/5",
+    "submitted_at": "2026-09-18T00:28:11Z",
+    "expires_at": "2026-09-18T12:28:11Z",
+}
+
+
+def verify_distribution_exception(
+    path: Path, tag: str, *, now: datetime | None = None
+) -> str:
+    """Verify the single, expiring release-distribution exception directly.
+
+    This is intentionally separate from the publication workflow.  It proves a
+    concrete external distribution submission during the short exception window;
+    it never changes source, tag, runner, package, or artifact verification.
+    """
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"distribution exception is unreadable: {exc}") from exc
+    if not isinstance(value, dict) or set(value) != set(_V016_HERMES_REGISTRY_EXCEPTION):
+        raise ReleaseError("distribution exception has an invalid schema")
+    for field in ("schema_version", "release_tag", "surface", "target", "submission_url", "submitted_at"):
+        if value[field] != _V016_HERMES_REGISTRY_EXCEPTION[field]:
+            raise ReleaseError(f"distribution exception has an unexpected {field}")
+    if tag != value["release_tag"]:
+        raise ReleaseError(
+            f"distribution exception is for {value['release_tag']!r}, not {tag!r}"
+        )
+    submitted_at = datetime.fromisoformat(value["submitted_at"].replace("Z", "+00:00"))
+    expires_at = datetime.fromisoformat(value["expires_at"].replace("Z", "+00:00"))
+    if expires_at - submitted_at != timedelta(hours=12):
+        raise ReleaseError("distribution exception must expire exactly 12 hours after submission")
+    expected_expiry = (submitted_at + timedelta(hours=12)).isoformat().replace("+00:00", "Z")
+    if value["expires_at"] != expected_expiry:
+        raise ReleaseError("distribution exception expiry must use canonical UTC form")
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None:
+        raise ReleaseError("distribution exception verification time must be timezone-aware")
+    current_utc = current.astimezone(UTC)
+    if current_utc < submitted_at:
+        raise ReleaseError("distribution exception is not yet active")
+    if current_utc >= expires_at:
+        raise ReleaseError("distribution exception has expired")
+    return f"PASS: active Hermes Registry distribution exception for {tag} until {value['expires_at']}"
 
 
 def _metadata(raw: bytes, source: str, project: dict) -> tuple[str, str]:
@@ -67,7 +120,12 @@ def _verify_payload(payload: dict[str, bytes], expected: dict[str, bytes], sourc
         raise ReleaseError(f"{source}: packaged source differs from reviewed source: {changed!r}")
 
 
-def verify(root: Path, tag: str, dist: Path | None = None) -> str:
+def verify(
+    root: Path,
+    tag: str,
+    dist: Path | None = None,
+    distribution_exception: Path | None = None,
+) -> str:
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     name = project["name"]
     version = project["version"]
@@ -95,8 +153,13 @@ def verify(root: Path, tag: str, dist: Path | None = None) -> str:
     if runner.read_bytes() != tracked_runner.read_bytes():
         raise ReleaseError("tracked .hermes runner must match src/hermes_gate/repo_runner.py")
 
+    distribution_result = ""
+    if distribution_exception is not None:
+        distribution_result = verify_distribution_exception(distribution_exception, tag)
+
     if dist is None:
-        return f"PASS: source identity is {name} {version} ({tag})"
+        result = f"PASS: source identity is {name} {version} ({tag})"
+        return f"{result}; {distribution_result}" if distribution_result else result
 
     wheel_name = f"hermes_gate-{version}-py3-none-any.whl"
     sdist_name = f"hermes_gate-{version}.tar.gz"
@@ -193,17 +256,23 @@ def verify(root: Path, tag: str, dist: Path | None = None) -> str:
             f"artifact identity must be {expected!r}; wheel={wheel_identity!r}, "
             f"sdist={sdist_identity!r}"
         )
-    return f"PASS: artifacts are {name} {version} ({tag})"
+    result = f"PASS: artifacts are {name} {version} ({tag})"
+    return f"{result}; {distribution_result}" if distribution_result else result
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tag", required=True)
     parser.add_argument("--dist", type=Path)
+    parser.add_argument(
+        "--distribution-exception",
+        type=Path,
+        help="directly verify the short-lived v0.1.6 Hermes Registry submission record",
+    )
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     args = parser.parse_args()
     try:
-        print(verify(args.root, args.tag, args.dist))
+        print(verify(args.root, args.tag, args.dist, args.distribution_exception))
     except (
         KeyError,
         OSError,
