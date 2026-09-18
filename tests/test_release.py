@@ -9,8 +9,8 @@ import sys
 import tarfile
 import tomllib
 import zipfile
-from pathlib import Path
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 

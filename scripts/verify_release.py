@@ -52,8 +52,8 @@ def verify_distribution_exception(
         raise ReleaseError(
             f"distribution exception is for {value['release_tag']!r}, not {tag!r}"
         )
-    submitted_at = datetime.fromisoformat(value["submitted_at"].replace("Z", "+00:00"))
-    expires_at = datetime.fromisoformat(value["expires_at"].replace("Z", "+00:00"))
+    submitted_at = datetime.fromisoformat(value["submitted_at"])
+    expires_at = datetime.fromisoformat(value["expires_at"])
     if expires_at - submitted_at != timedelta(hours=12):
         raise ReleaseError("distribution exception must expire exactly 12 hours after submission")
     expected_expiry = (submitted_at + timedelta(hours=12)).isoformat().replace("+00:00", "Z")
