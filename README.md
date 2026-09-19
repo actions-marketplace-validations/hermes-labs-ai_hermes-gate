@@ -42,7 +42,7 @@ one receipt-bound command in the checked-out repository:
 ```yaml
 steps:
   - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-  - uses: hermes-labs-ai/hermes-gate@v0.1.7
+  - uses: hermes-labs-ai/hermes-gate@v0.1.6
     with:
       command: full
 ```
@@ -231,6 +231,15 @@ session. Install it from this marketplace:
 runtime is byte-identical to `src/hermes_gate` and exercises the hook
 script as a subprocess with no `hermes-gate` package installed, so the
 marketplace artifact is tested the same way Claude Code runs it.
+
+The plugin carries two manifests because two specifications read different
+paths. Claude Code reads `claude-plugin/.claude-plugin/plugin.json`; Agent
+Plugins 1.0.0 resolves a manifest at the plugin root and does not recognize
+`.claude-plugin/`, so `claude-plugin/plugin.json` carries the same identity in
+that specification's field set. `tests/test_claude_plugin.py` and
+`scripts/verify_release.py` both fail closed if the two ever disagree on
+`name`, `version`, `description`, or `license`, or drift from the packaged
+version.
 
 ## Hermes Agent quality-gate seam
 
