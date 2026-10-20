@@ -1,13 +1,19 @@
+<div align="center">
+
 # HermesGate
+
+HermesGate runs a repository's own checks as a bounded completion ceremony, records exactly which content and tool versions were checked, and reuses a PASS only while those bytes still match.
+
+HermesGate is developed by [Hermes Labs](https://hermes-labs.ai).
+
+Hermes Labs is an agentic infrastructure company building the reliability layer for autonomous systems.
 
 [![Hermes quality rail](https://github.com/hermes-labs-ai/hermes-gate/actions/workflows/hermes-quality.yml/badge.svg)](https://github.com/hermes-labs-ai/hermes-gate/actions/workflows/hermes-quality.yml)
 [![PyPI](https://img.shields.io/pypi/v/hermes-gate)](https://pypi.org/project/hermes-gate/)
 [![Python](https://img.shields.io/pypi/pyversions/hermes-gate)](https://pypi.org/project/hermes-gate/)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-2ea44f)](LICENSE)
 
-HermesGate turns “run the checks again” into a bounded completion ceremony. It
-runs the repository's own commands, records exactly which content and tool
-versions were checked, and reuses a PASS only while those bytes still match.
+</div>
 
 It has no daemon and no runtime dependencies beyond Python 3.11+ and Git.
 Lifecycle hooks inspect receipts; they do not repair code, invoke a model, or
@@ -156,7 +162,7 @@ globs = ["**/*.py"]
 ## Optional primitive adapters
 
 HermesGate packages a standard-library loader and validator for the shared
-`gate-result/v1` schema. PyGate and QuickGate.js adapters are opt-in and
+`gate-result/v1` schema. PyGate and Quick Gate (npm `quick-gate`) adapters are opt-in and
 isolated; HermesGate never downloads or installs them.
 
 PyGate 0.2.0 or newer:
@@ -169,7 +175,7 @@ argv = ["pygate"]
 minimum_version = "0.2.0"
 ```
 
-QuickGate.js 0.2.3 or newer:
+Quick Gate (npm `quick-gate`) 0.2.3 or newer:
 
 ```toml
 [adapter]
@@ -184,21 +190,69 @@ the packaged contract, and then normalized into a HermesGate receipt. An absent,
 old, or invalid primitive returns `ERROR`; it never falls through to an
 unreviewed installation.
 
+## Relationship to PyGate and Quick Gate
+
+Three Hermes Labs tools share one result contract and stay separate on purpose:
+
+| Tool | Package / command | Role |
+| --- | --- | --- |
+| **HermesGate** ([hermes-gate](https://github.com/hermes-labs-ai/hermes-gate)) | PyPI `hermes-gate`, `hermes-gate` | Language-agnostic completion rail: runs a repository's declared checks and binds a PASS to exact content and tool versions in a receipt. |
+| **PyGate** ([quick-gate-python](https://github.com/hermes-labs-ai/quick-gate-python)) | PyPI `pygate-ci`, `pygate` | Python check primitive: normalizes Ruff, Pyright, and pytest into one `gate-result/v1`, with bounded lint repair. |
+| **Quick Gate** ([quick-gate-js](https://github.com/hermes-labs-ai/quick-gate-js)) | npm `quick-gate`, `quick-gate` | JavaScript/TypeScript check primitive: normalizes ESLint, TypeScript, build, and Lighthouse into one `gate-result/v1`, with bounded repair. |
+
+- **Shared primitive:** the `gate-result/v1` schema (`schemas/gate-result-v1.schema.json`) is byte-identical in all three repositories. PyGate and Quick Gate emit it; HermesGate validates it.
+- **Composition is optional:** HermesGate can wrap PyGate (0.2.0+) or Quick Gate (0.2.3+) through an opt-in [primitive adapter](https://github.com/hermes-labs-ai/hermes-gate#optional-primitive-adapters); it never installs them, and an absent, old, or invalid primitive is an error, not a pass. Each primitive is fully usable on its own.
+- **Which to use:** use PyGate or Quick Gate alone to get one normalized result for a Python or JS/TS project. Use HermesGate when you need a receipt proving which exact bytes passed which declared commands, across any stack.
+- **Names and interfaces are stable:** the three products keep their own names, commands, versions, and release cadence; this relationship adds no API change.
+
 ## Review and hooks
 
-`review` requires an exact fast PASS. CodeRabbit agent-mode JSONL is the initial
-provider boundary. If it is unavailable, a clean committed diff may use an
-installed `hermes-pr-review` fallback. Unparseable, unauthenticated, timed-out,
-or unavailable review output is never relabeled PASS.
+`review` requires an exact fast PASS. The `coderabbit` provider accepts
+CodeRabbit agent-mode JSONL. If it is unavailable, a clean committed diff may
+use an installed `hermes-pr-review` fallback. The `jsonl` provider accepts a
+local reviewer command with an explicit exact-diff completion claim. Unparseable,
+timed-out, or unavailable review output is never relabeled PASS.
 
-`review.provider` names that output contract and must be `coderabbit`;
+`review.provider` names that output contract and must be `coderabbit` or `jsonl`;
 `review.argv[0]` names the executable and may differ (for example a wrapper or
 the `cr` alias). Any other provider name is a profile error: `fast`, `review`,
 `full`, `repair`, and `boundary` all return `ERROR` with
 `invalid profile: review.provider …`, and `doctor` reports `profile.status:
 ERROR`, because a command the engine cannot bind to the diff or parse can only
 ever produce an unavailable or wrong review. `doctor` probes the executable the
-profile names, resolved the same way `review` launches it.
+profile names, resolved the same way `review` launches it. For `jsonl`, doctor
+reports executable availability and does not call a provider-specific auth command.
+
+For a local reviewer, configure the profile as follows:
+
+```toml
+[review]
+provider = "jsonl"
+argv = ["hermes-gate-claude-review"]
+timeout_seconds = 180.0
+material_severities = ["critical", "major"]
+material_categories = ["correctness", "security", "data-loss", "concurrency", "api-contract"]
+fallback_argv = []
+```
+
+Gate runs the argv in the repository root with `HERMES_GATE_DIFF_DIGEST` set to
+the current content digest and `HERMES_GATE_REVIEWED_PATHS` set to a JSON array
+of selected paths. The command must exit zero and print one JSON object per line.
+`hermes-gate-claude-review` is the optional bundled adapter for a subscription-backed
+Claude Code login. It assembles only the selected local Git diff (including
+untracked files), caps it at 128 KiB, disables Claude's tools, and rejects a
+missing subscription login or invalid model output. It performs no installation
+or authentication itself. Other trusted commands may implement the same contract.
+Optional finding events use `type`, `severity`, `category`, `path`, optional
+positive `line`, and nonempty `message`. The final event must be
+`{"type":"complete","digest":"<exact environment digest>","reviewed_paths":["<exact selected paths>"]}`.
+Gate rejects unknown events, malformed or out-of-scope findings, missing or
+mismatched completion, truncated output, and changes to scoped files during the
+review. Material findings make the receipt FAIL. Other findings are counted as
+suppressed. A PASS receipt records that this command claimed completion against
+the exact digest and produced no material findings; it does not prove the command
+examined every line, that its judgment was correct, or that unscoped files stayed
+unchanged. Use a trusted, bounded reviewer command, and inspect its receipt.
 
 `install-codex` and `uninstall-codex` are intentionally hidden integration
 commands. Codex integration preserves unrelated hook and instruction content.

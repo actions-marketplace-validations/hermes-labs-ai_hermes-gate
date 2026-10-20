@@ -1,18 +1,9 @@
-"""Regression coverage for the release-time Action-default guard.
-
-`evaluate` is the pure decision function `check_action_default_published.py`
-uses at release time; `fetch_pypi_releases` and `tag_has_action_yml` are its
-only network seams, `_input_default` is its action.yml parser, and
-`_github_headers` decides whether the GitHub contents lookup authenticates.
-Every test here injects fakes for the network seams, so none of this touches
-PyPI or GitHub. None of these tests assert a specific version literal in
-action.yml (the manifest is on its way to dropping a literal default
-entirely) -- `evaluate` and `_input_default` are exercised with inline
-fixture strings instead.
-"""
+"""Offline tests for the release-time Action install-version guard."""
 
 import runpy
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -34,139 +25,85 @@ def _unreachable(*_args, **_kwargs):
     raise AssertionError("must not touch the network for this case")
 
 
-# --- evaluate(): cases (a)-(f), re-expressed around the README ref, plus both
-# --- states of `default` (a literal string, and None for empty/absent). ---
-
-
-@pytest.mark.parametrize("default", ["0.1.8", None], ids=["literal-default", "no-default"])
-def test_releasing_the_tag_being_published_does_not_require_pypi(default) -> None:
-    """(a) releasing vX with README @vX not yet on PyPI -> pass, no network calls."""
+def test_releasing_default_version_uses_checked_out_action_without_pypi() -> None:
     message = evaluate(
-        default=default,
-        readme_version="0.1.8",
-        release_tag="v0.1.8",
-        local_action_yml_exists=True,
-        fetch_pypi_releases=_unreachable,
-        tag_has_action_yml=_unreachable,
+        default="0.1.8", release_tag="v0.1.8", local_action_yml_exists=True,
+        fetch_pypi_releases=_unreachable, tag_has_action_yml=_unreachable,
     )
-    assert "PASS" in message
-    assert "0.1.8" in message
+    assert "PASS" in message and "0.1.8" in message
 
 
-@pytest.mark.parametrize("default", ["0.1.7", None], ids=["literal-default", "no-default"])
-def test_releasing_a_newer_tag_still_checks_an_older_readme_ref(default) -> None:
-    """(b) releasing vX, README @vY (Y<X) already published, tag vY has action.yml -> pass."""
+def test_releasing_without_literal_default_uses_release_tag() -> None:
     message = evaluate(
-        default=default,
-        readme_version="0.1.7",
-        release_tag="v0.1.8",
-        local_action_yml_exists=True,
+        default=None, release_tag="v0.1.8", local_action_yml_exists=True,
+        fetch_pypi_releases=_unreachable, tag_has_action_yml=_unreachable,
+    )
+    assert "PASS" in message and "0.1.8" in message
+
+
+def test_older_action_default_must_be_published_and_installable() -> None:
+    message = evaluate(
+        default="0.1.7", release_tag="v0.1.8", local_action_yml_exists=True,
         fetch_pypi_releases=lambda: _releases("0.1.7"),
         tag_has_action_yml=lambda version: version == "0.1.7",
     )
     assert "PASS" in message
 
 
-def test_tag_missing_action_yml_fails_and_names_the_tag() -> None:
-    """(c) README @vY published but tag vY lacks action.yml (the real v0.1.6 case) -> fail."""
+def test_older_default_tag_missing_action_fails() -> None:
     with pytest.raises(ValueError, match="v0.1.6"):
         evaluate(
-            default=None,
-            readme_version="0.1.6",
-            release_tag="",
-            local_action_yml_exists=True,
+            default="0.1.6", release_tag="v0.1.8", local_action_yml_exists=True,
             fetch_pypi_releases=lambda: _releases("0.1.6"),
             tag_has_action_yml=lambda version: False,
         )
 
 
-def test_unpublished_readme_ref_outside_a_matching_release_fails() -> None:
-    """(d) README ref not on PyPI and not the release tag -> fail."""
+def test_unpublished_older_default_fails() -> None:
     with pytest.raises(ValueError, match="not a published"):
         evaluate(
-            default=None,
-            readme_version="0.1.8",
-            release_tag="",
-            local_action_yml_exists=True,
+            default="0.1.8", release_tag="v0.1.9", local_action_yml_exists=True,
             fetch_pypi_releases=lambda: _releases("0.1.7"),
             tag_has_action_yml=_unreachable,
         )
 
 
-def test_readme_and_default_mismatch_fails_before_any_network_call() -> None:
-    """(e) README ref != a *present* action.yml default -> fail."""
-    with pytest.raises(ValueError, match="does not match"):
+def test_missing_default_and_release_tag_fails_closed() -> None:
+    with pytest.raises(ValueError, match="RELEASE_TAG"):
         evaluate(
-            default="0.1.7",
-            readme_version="0.1.6",
-            release_tag="",
-            local_action_yml_exists=True,
-            fetch_pypi_releases=_unreachable,
-            tag_has_action_yml=_unreachable,
+            default=None, release_tag="", local_action_yml_exists=True,
+            fetch_pypi_releases=_unreachable, tag_has_action_yml=_unreachable,
         )
 
 
-def test_empty_default_skips_the_mismatch_check_entirely() -> None:
-    """An absent/empty default never fails the mismatch check, whatever the README
-    says. Whether that is *safe* (i.e. action.yml has a working ref-derived
-    resolver) is asserted by tests/test_action_metadata.py -- owned by the
-    action.yml change that introduces the empty default -- not re-checked
-    here (see module docstring)."""
-    message = evaluate(
-        default=None,
-        readme_version="0.1.6",
-        release_tag="",
-        local_action_yml_exists=True,
-        fetch_pypi_releases=lambda: _releases("0.1.6"),
-        tag_has_action_yml=lambda version: True,
-    )
-    assert "PASS" in message
-
-
 def test_pypi_network_error_fails_closed() -> None:
-    """(f) a network error looking up PyPI fails closed with a readable message."""
-
     def broken_fetch():
-        raise ValueError("network error fetching https://pypi.org/pypi/hermes-gate/json: timed out")
+        raise ValueError("network error fetching PyPI: timed out")
 
     with pytest.raises(ValueError, match="network error"):
         evaluate(
-            default=None,
-            readme_version="0.1.7",
-            release_tag="",
-            local_action_yml_exists=True,
-            fetch_pypi_releases=broken_fetch,
-            tag_has_action_yml=_unreachable,
+            default="0.1.7", release_tag="v0.1.8", local_action_yml_exists=True,
+            fetch_pypi_releases=broken_fetch, tag_has_action_yml=_unreachable,
         )
 
 
 def test_github_contents_network_error_fails_closed() -> None:
-    """A network error checking the tag tree also fails closed, not just the PyPI leg."""
-
     def broken_tag_check(_version):
-        raise ValueError("network error fetching https://api.github.com/...: timed out")
+        raise ValueError("network error fetching GitHub: timed out")
 
     with pytest.raises(ValueError, match="network error"):
         evaluate(
-            default=None,
-            readme_version="0.1.7",
-            release_tag="",
-            local_action_yml_exists=True,
+            default="0.1.7", release_tag="v0.1.8", local_action_yml_exists=True,
             fetch_pypi_releases=lambda: _releases("0.1.7"),
             tag_has_action_yml=broken_tag_check,
         )
 
 
-def test_release_tag_checkout_without_action_yml_fails_closed() -> None:
-    """Releasing vX whose own checked-out tree has no action.yml must still fail."""
+def test_release_checkout_without_action_fails_closed() -> None:
     with pytest.raises(ValueError, match="action.yml"):
         evaluate(
-            default=None,
-            readme_version="0.1.8",
-            release_tag="v0.1.8",
-            local_action_yml_exists=False,
-            fetch_pypi_releases=_unreachable,
-            tag_has_action_yml=_unreachable,
+            default="0.1.8", release_tag="v0.1.8", local_action_yml_exists=False,
+            fetch_pypi_releases=_unreachable, tag_has_action_yml=_unreachable,
         )
 
 
@@ -236,6 +173,117 @@ def test_fetch_pypi_releases_fails_closed_on_non_200() -> None:
             fetch_pypi_releases()
     finally:
         fetch_pypi_releases.__globals__["_get"] = original_get
+
+
+def test_get_retries_transient_http_status_then_succeeds() -> None:
+    get = fetch_pypi_releases.__globals__["_get"]
+    calls = []
+    delays = []
+
+    class Response:
+        def __init__(self, status: int, body: bytes):
+            self.status = status
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return self.body
+
+    responses = [Response(503, b"retry"), Response(200, b"ok")]
+    original_urlopen = get.__globals__["urlopen"]
+    get.__globals__["urlopen"] = lambda *_args, **_kwargs: (calls.append(1), responses.pop(0))[1]
+    try:
+        status, body = get("https://example.test", headers={}, sleep=delays.append)
+    finally:
+        get.__globals__["urlopen"] = original_urlopen
+    assert (status, body) == (200, b"ok")
+    assert len(calls) == 2
+    assert delays == [1.0]
+
+
+def test_get_retries_http_error_response_then_succeeds() -> None:
+    get = fetch_pypi_releases.__globals__["_get"]
+    calls = []
+
+    class Response:
+        status = 200
+
+        @property
+        def headers(self):
+            return {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b"ok"
+
+    def transient_then_ok(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise HTTPError("https://example.test", 503, "unavailable", {}, BytesIO(b"retry"))
+        return Response()
+
+    original_urlopen = get.__globals__["urlopen"]
+    get.__globals__["urlopen"] = transient_then_ok
+    try:
+        assert get("https://example.test", headers={}, sleep=lambda _delay: None) == (200, b"ok")
+    finally:
+        get.__globals__["urlopen"] = original_urlopen
+    assert len(calls) == 2
+
+
+def test_get_retries_transient_transport_then_fails_closed_on_exhaustion() -> None:
+    get = fetch_pypi_releases.__globals__["_get"]
+    calls = []
+    delays = []
+
+    def unavailable(*_args, **_kwargs):
+        calls.append(1)
+        raise URLError("temporarily unavailable")
+
+    original_urlopen = get.__globals__["urlopen"]
+    get.__globals__["urlopen"] = unavailable
+    try:
+        with pytest.raises(ValueError, match="after 3 attempts"):
+            get("https://example.test", headers={}, sleep=delays.append)
+    finally:
+        get.__globals__["urlopen"] = original_urlopen
+    assert len(calls) == 3
+    assert delays == [1.0, 2.0]
+
+
+def test_get_does_not_retry_permanent_http_status() -> None:
+    get = fetch_pypi_releases.__globals__["_get"]
+    calls = []
+
+    class Response:
+        status = 404
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b"missing"
+
+    original_urlopen = get.__globals__["urlopen"]
+    get.__globals__["urlopen"] = lambda *_args, **_kwargs: (calls.append(1), Response())[1]
+    try:
+        assert get("https://example.test", headers={}, sleep=lambda _delay: None) == (404, b"missing")
+    finally:
+        get.__globals__["urlopen"] = original_urlopen
+    assert len(calls) == 1
 
 
 # --- Defect 3: GitHub contents auth, and its strict isolation from PyPI ---
@@ -376,6 +424,12 @@ def test_input_default_empty_string_is_none() -> None:
     assert _input_default(_MANIFEST_EMPTY_DEFAULT, "version") is None
 
 
+def test_input_default_rejects_non_string_yaml_values() -> None:
+    manifest = "inputs:\n  version:\n    default: 0.1\n"
+    with pytest.raises(TypeError, match=r"inputs\.version\.default.*float 0\.1"):
+        _input_default(manifest, "version")
+
+
 def test_input_default_missing_key_is_none() -> None:
     assert _input_default(_MANIFEST_NO_DEFAULT_KEY, "version") is None
 
@@ -389,7 +443,7 @@ def test_input_default_missing_input_is_none() -> None:
 
 def test_input_default_strips_unquoted_trailing_comment() -> None:
     """`default: 0.1.7 # current` must read as `0.1.7`, not `0.1.7 # current`
-    (which would falsely mismatch a legitimate release's own README ref)."""
+    (which would misidentify the Action install version)."""
     manifest = """\
 inputs:
   version:
@@ -401,10 +455,16 @@ inputs:
 
 
 def test_input_default_strips_tab_separated_unquoted_comment() -> None:
-    """hermes-gate review (correctness, major): YAML's separator whitespace
-    before a comment is space OR tab, not only a literal " #"."""
+    """A tab in a plain YAML scalar is invalid, so the guard must fail closed."""
     manifest = "inputs:\n  version:\n    description: x\n    required: false\n    default: 0.1.7\t# current\n"
-    assert _input_default(manifest, "version") == "0.1.7"
+    with pytest.raises(ValueError, match="not valid YAML"):
+        _input_default(manifest, "version")
+
+
+@pytest.mark.parametrize("default", ["default: # derived from ref", "default:   # derived from ref"])
+def test_input_default_comment_only_is_none(default: str) -> None:
+    manifest = f"inputs:\n  version:\n    description: x\n    required: false\n    {default}\n"
+    assert _input_default(manifest, "version") is None
 
 
 def test_input_default_strips_comment_after_quoted_empty_string() -> None:
@@ -470,9 +530,8 @@ inputs:
 def test_input_default_handles_the_reviewer_reported_adversarial_case() -> None:
     """`hermes-gate review` (correctness, major): a naive scan of
     `'0.1.7'' # incompatible' # note` mistook the escaped `''` for the closing
-    quote and returned `0.1.7`, which matched a `v0.1.7` README ref even
-    though the real YAML value -- confirmed against PyYAML -- is
-    `0.1.7' # incompatible`, which must NOT match and must fail closed."""
+    quote and returned `0.1.7` even though the real YAML value -- confirmed
+    against PyYAML -- is `0.1.7' # incompatible`."""
     manifest = """\
 inputs:
   version:
@@ -484,10 +543,7 @@ inputs:
 
 
 def test_input_default_rejects_non_comment_trailing_content() -> None:
-    """`hermes-gate review` (correctness, major): `"0.1.7" trailing` is not
-    valid YAML (only whitespace-then-`#` may follow a quoted scalar). Silently
-    discarding the trailing token would falsely accept it as `0.1.7`; instead
-    the raw value must survive unchanged so it fails the version comparison."""
+    """Malformed YAML must fail closed rather than accept a parsed prefix."""
     manifest = """\
 inputs:
   version:
@@ -495,7 +551,8 @@ inputs:
     required: false
     default: "0.1.7" trailing
 """
-    assert _input_default(manifest, "version") == '"0.1.7" trailing'
+    with pytest.raises(ValueError, match="not valid YAML"):
+        _input_default(manifest, "version")
 
 
 def test_input_default_allows_trailing_whitespace_with_no_comment() -> None:

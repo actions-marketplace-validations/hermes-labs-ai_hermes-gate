@@ -1,210 +1,55 @@
-"""Fail closed unless the Marketplace Action's README example is installable.
+"""Verify the Action install version during a release without reading README content.
 
-This runs at release time (see `.github/workflows/publish.yml`), not inside the
-pytest suite, so the normal PR gate never depends on an unauthenticated network
-call. The version this guard reasons about is always the one in the README's
-copyable `uses: hermes-labs-ai/hermes-gate@vX` example, because that is the
-only version a user copying the quickstart actually asks for. `action.yml`'s
-`version` input MAY also carry a literal `default: X` (today's main does); when
-it does, it must agree with the README. It may instead be empty or absent (the
-install version derived at runtime from the Action ref instead, the psf/black
-pattern) -- in that case there is nothing to compare it to, so the default
-comparison is simply skipped. Whether an empty default is *safe* to skip past
-(i.e. whether action.yml actually implements a working ref-derived resolver)
-is a property of action.yml, not of this guard: it is asserted by
-`tests/test_action_metadata.py`, owned by whichever change makes the default
-empty. An earlier revision of this guard tried to re-check that property here
-too, via a bare `"github.action_ref" in manifest` substring search; an
-independent verifier showed that check wrong in both directions (a comment
-mentioning `github.action_ref` with no working resolver still passed; a
-resolver spelled as the env var `$GITHUB_ACTION_REF` instead of the context
-expression still failed), so it was removed rather than patched further --
-it was a second, weaker source of truth for something action.yml's own tests
-already own.
-
-Two cases, independent of whether a literal default is present:
-
-* Releasing tag vX whose README already says `@vX`: X cannot be on PyPI yet --
-  publishing X is what this workflow run is about to do -- so requiring it
-  would deadlock every legitimate release. `actions/checkout` resolved the
-  release ref, so the checked-out tree already IS vX's own tree; this case
-  only needs that tree to actually contain `action.yml`.
-* Every other case (a local run, PR CI, or a release whose README still names
-  some earlier version Y != X): the named version must already be a published
-  PyPI release, AND its tag must exist and contain `action.yml`. That second
-  half closes a real incident: main briefly named `@v0.1.6` in the README
-  while tag `v0.1.6` predates the Marketplace Action and has no `action.yml`
-  at all -- the previous version of this guard checked only PyPI and the
-  README/default match, so it printed PASS. The tag check is proven against
-  the public GitHub contents API (`action.yml?ref=vX`) so a shallow, tagless
-  `actions/checkout` needs no extra fetch depth. It authenticates with
-  `GITHUB_TOKEN` when the workflow provides one (avoids shared-runner-IP rate
-  limiting; never required for this public repo, and never sent to PyPI). A
-  network failure fails closed with a readable message; it never falls
-  through to a pass.
+The Action's literal version input default is the install version when present.
+When it is absent, the release tag identifies the checked-out Action version.
+The version being published may not exist on PyPI yet; older defaults must
+already be published and have an Action manifest at their tag.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
+import time
+from collections.abc import Callable
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[2]
 REPO_SLUG = "hermes-labs-ai/hermes-gate"
 PYPI_URL = "https://pypi.org/pypi/hermes-gate/json"
-
-
-def _direct_child_range(
-    lines: list[tuple[int, str]], start: int, end: int, key: str
-) -> tuple[int, int] | None:
-    """Find `key:` as a direct child within lines[start:end]; return the index
-    range of *its* nested block (exclusive of the `key:` line itself), or None.
-
-    "Direct child" means: at the minimum indentation level present in
-    [start:end) (YAML siblings share one indent), matched by the *entire*
-    stripped line equalling `f"{key}:"` -- not merely containing it, which is
-    what let a substring match like "python-version:" satisfy a search for
-    "version:" before this rewrite.
-    """
-    if start >= end:
-        return None
-    child_level = min(indent for indent, _ in lines[start:end])
-    for i in range(start, end):
-        indent, content = lines[i]
-        if indent == child_level and content == f"{key}:":
-            j = i + 1
-            while j < end and lines[j][0] > child_level:
-                j += 1
-            return i + 1, j
-    return None
-
-
-def _closing_quote_index(value: str) -> int | None:
-    """Return the index of the closing quote matching `value[0]` (a quote
-    character), or None if unterminated.
-
-    Honors each YAML quote form's escape rule: a single-quoted scalar escapes
-    an embedded `'` by doubling it (`''`); a double-quoted scalar escapes an
-    embedded `"` with a backslash (`\\"`). A naive "find the next quote
-    character" scan (hermes-gate review, correctness, major) mistook the
-    escape's first character for the terminator on input like
-    `'0.1.7'' # incompatible' # note` (a valid, if perverse, single-quoted
-    scalar whose real value -- confirmed against PyYAML -- is
-    `0.1.7' # incompatible`), truncating early and accepting a value the
-    guard should have rejected. This scans past an escaped quote instead of
-    stopping at it.
-    """
-    quote = value[0]
-    i = 1
-    while i < len(value):
-        if quote == "'" and value[i] == "'":
-            if i + 1 < len(value) and value[i + 1] == "'":
-                i += 2
-                continue
-            return i
-        if quote == '"':
-            if value[i] == "\\":
-                i += 2
-                continue
-            if value[i] == '"':
-                return i
-        i += 1
-    return None
-
-
-_UNQUOTED_COMMENT = re.compile(r"\s#")
-
-
-def _strip_inline_comment(value: str) -> str:
-    """Return `value` with any trailing YAML comment removed.
-
-    A `#` only starts a comment outside of a quoted scalar: for an unquoted
-    value, cut at the first whitespace-then-`#` (YAML's separator whitespace
-    is space or tab, not just a literal " #" -- hermes-gate review,
-    correctness, major, flagged the earlier literal-space-only check against
-    `default: 0.1.7\\t# current`) and rstrip; for a value that starts with a
-    quote, the scalar ends at its matching closing quote (see
-    `_closing_quote_index`) and only whitespace-then-`#` after that is a
-    comment -- a `#` *inside* the quotes is ordinary content, never a comment
-    marker. Any other, non-comment content after the closing quote is not
-    valid YAML; rather than silently discard it (hermes-gate review,
-    correctness, major: `default: "0.1.7" trailing` returning the quoted
-    prefix would falsely accept a malformed manifest), this returns the
-    whole raw value unchanged so it fails the version comparison instead of
-    a false pass.
-    """
-    value = value.strip()
-    if not value:
-        return value
-    if value[0] in "\"'":
-        closing = _closing_quote_index(value)
-        if closing is None:
-            return value  # Unterminated quote; treat the remainder as content.
-        remainder = value[closing + 1 :]
-        trimmed = remainder.strip()
-        if trimmed and not (remainder[:1].isspace() and trimmed.startswith("#")):
-            return value
-        return value[: closing + 1]
-    match = _UNQUOTED_COMMENT.search(value)
-    return value[: match.start()].rstrip() if match else value
-
-
-def _unquote(value: str) -> str:
-    """Undo YAML quoting, including the two escape forms quoted scalars use.
-
-    Deliberately does not implement double-quoted YAML's full escape grammar
-    (`\\n`, `\\t`, `\\uXXXX`, ...): a version default that needed those would
-    not be a value this guard could sensibly compare against a SemVer-shaped
-    README ref, and this script stays stdlib-only and intentionally short of
-    a real YAML parser (see `_input_default`).
-    """
-    if len(value) < 2 or value[0] != value[-1] or value[0] not in "\"'":
-        return value
-    inner = value[1:-1]
-    if value[0] == "'":
-        return inner.replace("''", "'")
-    return inner.replace('\\"', '"')
+NETWORK_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 1.0
 
 
 def _input_default(manifest: str, input_name: str) -> str | None:
-    """Return the literal `default:` scalar for `inputs.<input_name>` in an
-    action.yml manifest, or None when the input, its default key, or a
-    non-empty value is absent.
-
-    Structural and indentation-aware rather than a single regex over the raw
-    text, and stdlib-only: this repository ships zero runtime dependencies
-    (`dependencies = []` in pyproject.toml) and the publish workflow's `build`
-    job never installs PyYAML, so this parser has to stay dependency-free too.
-    Scoping strictly to the `inputs.<input_name>` block (see
-    `_direct_child_range`) means input declaration order does not matter and
-    an unrelated input whose key merely contains "<input_name>" as a
-    substring (e.g. `python-version` vs. `version`) cannot be matched instead.
-    """
-    lines = [
-        (len(raw) - len(raw.lstrip(" ")), stripped)
-        for raw in manifest.splitlines()
-        if (stripped := raw.strip()) and not stripped.startswith("#")
-    ]
-    inputs_range = _direct_child_range(lines, 0, len(lines), "inputs")
-    if inputs_range is None:
+    """Return an Action input's default using YAML's safe scalar semantics."""
+    try:
+        document = yaml.safe_load(manifest)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"action.yml is not valid YAML: {exc}") from exc
+    if not isinstance(document, dict):
         return None
-    input_range = _direct_child_range(lines, *inputs_range, input_name)
-    if input_range is None:
+    inputs = document.get("inputs")
+    if not isinstance(inputs, dict):
         return None
-    start, end = input_range
-    if start >= end:
+    definition = inputs.get(input_name)
+    if not isinstance(definition, dict):
         return None
-    field_level = min(indent for indent, _ in lines[start:end])
-    for indent, content in lines[start:end]:
-        if indent == field_level and content.startswith("default:"):
-            raw_value = content[len("default:") :]
-            value = _unquote(_strip_inline_comment(raw_value))
-            return value or None
-    return None
+    value = definition.get("default")
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        preview = repr(value)
+        if len(preview) > 80:
+            preview = preview[:77] + "..."
+        raise TypeError(
+            f"inputs.{input_name}.default must be a string; got {type(value).__name__} {preview}"
+        )
+    return value
 
 
 def read_action_default() -> str | None:
@@ -215,15 +60,6 @@ def read_action_default() -> str | None:
     return _input_default(manifest, "version")
 
 
-def read_readme_ref() -> str:
-    """Return the version named by the README's copyable Action ref."""
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    match = re.search(r"uses: hermes-labs-ai/hermes-gate@v(\S+)", readme)
-    if not match:
-        raise ValueError("README.md has no readable Action ref")
-    return match.group(1)
-
-
 def check_published(version: str, releases: dict) -> None:
     """Reject a version absent from PyPI or published with no files."""
     files = releases.get(version)
@@ -231,15 +67,54 @@ def check_published(version: str, releases: dict) -> None:
         raise ValueError(f"hermes-gate {version!r} is not a published PyPI release")
 
 
-def _get(url: str, *, headers: dict[str, str], timeout: float = 30) -> tuple[int, bytes]:
-    """GET `url`, returning (status, body). Raise ValueError on transport failure."""
-    try:
-        with urlopen(Request(url, headers=headers), timeout=timeout) as response:
-            return response.status, response.read()
-    except HTTPError as exc:
-        return exc.code, exc.read()
-    except (URLError, TimeoutError, OSError) as exc:
-        raise ValueError(f"network error fetching {url}: {exc}") from exc
+def _get(
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout: float = 30,
+    attempts: int = NETWORK_ATTEMPTS,
+    sleep: Callable[[float], None] | None = None,
+) -> tuple[int, bytes]:
+    """GET `url` with bounded retries for transient transport/server failures."""
+    if attempts < 1:
+        raise ValueError("network attempts must be at least one")
+    transient_statuses = {408, 425, 429, 500, 502, 503, 504}
+    last_error: Exception | None = None
+    sleep = sleep or time.sleep
+    for attempt in range(attempts):
+        try:
+            with urlopen(Request(url, headers=headers), timeout=timeout) as response:
+                status, body = response.status, response.read()
+                response_headers = getattr(response, "headers", {})
+            retryable = status in transient_statuses or (
+                status == 403
+                and (
+                    response_headers.get("X-RateLimit-Remaining") == "0"
+                    or bool(response_headers.get("Retry-After"))
+                )
+            )
+            if not retryable or attempt + 1 == attempts:
+                return status, body
+            last_error = ValueError(f"HTTP {status}")
+        except HTTPError as exc:
+            retryable = exc.code in transient_statuses or (
+                exc.code == 403
+                and (
+                    getattr(exc, "headers", {}).get("X-RateLimit-Remaining") == "0"
+                    or bool(getattr(exc, "headers", {}).get("Retry-After"))
+                )
+            )
+            if not retryable or attempt + 1 == attempts:
+                return exc.code, exc.read()
+            last_error = exc
+        except (URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+            if attempt + 1 == attempts:
+                raise ValueError(
+                    f"network error fetching {url} after {attempts} attempts: {exc}"
+                ) from exc
+        sleep(RETRY_DELAY_SECONDS * (2**attempt))
+    raise ValueError(f"network error fetching {url} after {attempts} attempts: {last_error}")
 
 
 def fetch_pypi_releases() -> dict:
@@ -296,67 +171,46 @@ def tag_has_action_yml(version: str, *, fetch_status=None) -> bool:
 def evaluate(
     *,
     default: str | None,
-    readme_version: str,
     release_tag: str,
     local_action_yml_exists: bool,
     fetch_pypi_releases=fetch_pypi_releases,
     tag_has_action_yml=tag_has_action_yml,
 ) -> str:
-    """Return a PASS message, or raise ValueError describing the failure.
-
-    The README ref (`readme_version`) is the version this guard reasons about.
-    `default` is a *consistency* check only when action.yml carries a literal
-    one; an empty/absent default (`None`) skips that comparison entirely --
-    whether that is *safe* is asserted elsewhere, by action.yml's own tests
-    (see module docstring), not re-verified here.
-
-    Pure decision logic, factored out of `main()` so tests can inject fake
-    `fetch_pypi_releases`/`tag_has_action_yml` callables instead of touching
-    the network or the real action.yml/README.md.
-    """
-    if default and default != readme_version:
+    """Check the install version named by Action metadata for this release."""
+    if not local_action_yml_exists:
         raise ValueError(
-            f"action.yml default {default!r} does not match README ref v{readme_version!r}"
+            f"release tag {release_tag!r} checkout has no action.yml at the repository root"
         )
+    if not default and not release_tag.startswith("v"):
+        raise ValueError("action.yml has no version default and RELEASE_TAG is missing")
+    action_version = default or release_tag[1:]
 
-    if release_tag == f"v{readme_version}":
-        # actions/checkout resolved the release ref, so the checked-out tree
-        # already IS v{readme_version}'s own tree; PyPI cannot have this
-        # version yet because publishing it is what this run is about to do.
-        if not local_action_yml_exists:
-            raise ValueError(
-                f"release tag {release_tag!r} checkout has no action.yml at the repository root"
-            )
-        default_note = (
-            f"action.yml default {default!r} matches it"
-            if default
-            else "action.yml has no literal default (version is pinned by the ref at install time)"
-        )
+    if release_tag == f"v{action_version}":
+        # Publishing this release makes its package available; PyPI cannot
+        # contain it yet. The checked-out tag already contains action.yml.
         return (
-            f"PASS: README ref v{readme_version} is the release tag {release_tag!r} "
-            f"being published; {default_note}; action.yml is present in the checked-out tree"
+            f"PASS: Action install version {action_version} is release tag "
+            f"{release_tag!r} being published; action.yml is present"
         )
 
     releases = fetch_pypi_releases()
-    check_published(readme_version, releases)
-    if not tag_has_action_yml(readme_version):
+    check_published(action_version, releases)
+    if not tag_has_action_yml(action_version):
         raise ValueError(
-            f"tag 'v{readme_version}' does not contain action.yml, so the README Action "
-            f"ref names a tag that cannot install the Marketplace Action"
+            f"tag 'v{action_version}' does not contain action.yml, so the Action "
+            "default names a tag that cannot install the Marketplace Action"
         )
     return (
-        f"PASS: README ref v{readme_version} matches a published PyPI release and "
-        f"tag 'v{readme_version}' contains action.yml"
+        f"PASS: Action install version {action_version} is a published PyPI release "
+        f"and tag 'v{action_version}' contains action.yml"
     )
 
 
 def main() -> None:
     default = read_action_default()
-    readme_version = read_readme_ref()
     release_tag = os.environ.get("RELEASE_TAG", "")
     message = evaluate(
         default=default,
-        readme_version=readme_version,
         release_tag=release_tag,
         local_action_yml_exists=(ROOT / "action.yml").is_file(),
     )
